@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+send-once: idempotent email send wrapper.
+
+Route every scheduled, scripted, or agent-driven email send through this
+wrapper. It puts the "at most once" guarantee in code instead of relying
+on prose instructions like "don't send twice":
+
+1. Ledger check: if this operation key already recorded as sent/verified,
+   refuse. The operation key is YOUR idempotency key (deterministic,
+   e.g. "morning-brief-2026-09-17").
+2. Pre-send Sent check: search Sent for same recipient + subject in the
+   last N hours; if a match exists, refuse. Sent is the source of truth,
+   so this gate works even if the ledger is lost or the run moved machines.
+3. Send once via your mailer CLI.
+4. On ambiguous failure (timeout, empty output, lost response): NEVER
+   blind retry. Re-check Sent; if the send landed, record it and report
+   honestly. If it can't be confirmed, exit 3 and let a human verify.
+
+Usage:
+    send-once --key <op-id> --to <addr> --subject <s> --body-file <f>
+
+Exit codes:
+    0  sent (or already sent - recorded in ledger / found in Sent)
+    2  refused as duplicate (a gate fired)
+    3  send failed and Sent check could not confirm (human must verify)
+
+Mailer contract: send-once shells out to a CLI you configure via
+SEND_ONCE_MAILER (space-separated) or --mailer. That CLI must support:
+
+    <mailer> +triage --query 'in:sent to:<addr> newer_than:<N>h' \
+        --max 20 --format json [--account <acct>]
+        -> JSON: a list of {"id", "subject", ...}, or {"messages": [...]}
+
+    <mailer> +send --to <addr> --subject <s> --body <text> [--account <acct>]
+        -> exit 0 on success; JSON stdout with an "id" or "message_id"
+           field is picked up for the ledger when present.
+
+Any Gmail CLI that can list Sent and send mail can be adapted to this
+protocol with a thin shim.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def log(msg: str) -> None:
+    print(f"[send-once] {msg}", flush=True)
+
+
+def resolve_mailer(cli_flag):
+    if cli_flag:
+        return shlex.split(cli_flag)
+    env = os.environ.get("SEND_ONCE_MAILER")
+    if env:
+        return shlex.split(env)
+    log("ERROR: no mailer configured. Set SEND_ONCE_MAILER "
+        "or pass --mailer '<cmd>'. See README for the mailer contract.")
+    sys.exit(2)
+
+
+def resolve_ledger():
+    env = os.environ.get("SEND_ONCE_LEDGER")
+    if env:
+        return Path(env).expanduser()
+    base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "send-once" / "ledger.db"
+
+
+def normalize_subject(s: str) -> str:
+    return re.sub(r"^(re|fwd)\s*:\s*", "", s.strip(), flags=re.I)
+
+
+def run_cli(cli, args, timeout=120):
+    return subprocess.run(
+        cli + args, capture_output=True, text=True, timeout=timeout
+    )
+
+
+def ensure_ledger(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS sends (
+             op_key TEXT PRIMARY KEY,
+             to_addr TEXT, subject TEXT,
+             status TEXT, message_id TEXT,
+             created_at TEXT, notes TEXT)"""
+    )
+    conn.commit()
+    return conn
+
+
+def ledger_status(conn, op_key):
+    row = conn.execute(
+        "SELECT status, message_id FROM sends WHERE op_key=?", (op_key,)
+    ).fetchone()
+    return row
+
+
+def ledger_record(conn, op_key, to_addr, subject, status, message_id=None, notes=None):
+    conn.execute(
+        """INSERT INTO sends(op_key,to_addr,subject,status,message_id,created_at,notes)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(op_key) DO UPDATE SET
+             status=excluded.status, message_id=excluded.message_id,
+             notes=excluded.notes""",
+        (op_key, to_addr, subject, status, message_id,
+         datetime.now(timezone.utc).isoformat(), notes),
+    )
+    conn.commit()
+
+
+def sent_search(cli, to_addr, subject, account, window_hours):
+    """Search Sent for same recipient + subject. Returns list of (id, subject),
+    or None when the check itself was inconclusive."""
+    # Gmail search: in:sent to:<addr> with subject filter; verify exact match in code.
+    query = f'in:sent to:{to_addr} newer_than:{window_hours}h'
+    args = ["+triage", "--query", query, "--max", "20", "--format", "json"]
+    if account:
+        args += ["--account", account]
+    try:
+        r = run_cli(cli, args)
+    except subprocess.TimeoutExpired:
+        log("Sent pre-check timed out; treating as inconclusive")
+        return None
+    if r.returncode != 0:
+        log(f"Sent pre-check failed (rc={r.returncode}): {r.stderr[:200]}")
+        return None
+    try:
+        items = json.loads(r.stdout) if r.stdout.strip() else []
+    except json.JSONDecodeError:
+        log("Sent pre-check returned unparsable output; treating as inconclusive")
+        return None
+    target = normalize_subject(subject)
+    hits = []
+    for m in items if isinstance(items, list) else items.get("messages", []):
+        subj = m.get("subject", "")
+        if normalize_subject(subj) == target:
+            hits.append((m.get("id"), subj))
+    return hits
+
+
+def do_send(cli, to_addr, subject, body_file, account):
+    try:
+        body = Path(body_file).read_text(encoding="utf-8")
+    except OSError as e:
+        return ("ambiguous", f"could not read body file: {e}")
+    cmd = ["+send", "--to", to_addr, "--subject", subject, "--body", body]
+    if account:
+        cmd += ["--account", account]
+    try:
+        r = run_cli(cli, cmd, timeout=180)
+    except subprocess.TimeoutExpired as e:
+        return ("ambiguous", f"send timed out: {e}")
+    if r.returncode == 0:
+        msg_id = None
+        try:
+            payload = json.loads(r.stdout) if r.stdout.strip() else {}
+            msg_id = payload.get("id") or payload.get("message_id")
+        except json.JSONDecodeError:
+            pass
+        return ("sent", msg_id or "sent-ok")
+    out = (r.stdout + r.stderr).strip()
+    return ("ambiguous", f"rc={r.returncode} out={out[:300]}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Idempotent email send wrapper.")
+    ap.add_argument("--key", required=True,
+                    help="deterministic operation id, e.g. loop-morning-brief-2026-09-17")
+    ap.add_argument("--to", required=True)
+    ap.add_argument("--subject", required=True)
+    ap.add_argument("--body-file", required=True)
+    ap.add_argument("--account", default=None)
+    ap.add_argument("--window-hours", type=int, default=24)
+    ap.add_argument("--mailer", default=None,
+                    help="space-separated mailer CLI (overrides SEND_ONCE_MAILER)")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    cli = resolve_mailer(a.mailer)
+    conn = ensure_ledger(resolve_ledger())
+
+    # Gate 1: ledger
+    row = ledger_status(conn, a.key)
+    if row and row[0] in ("sent", "verified"):
+        log(f"REFUSED: op key {a.key} already recorded as {row[0]} (id={row[1]}). Not sending.")
+        return 0
+
+    # Gate 2: Sent search
+    hits = sent_search(cli, a.to, a.subject, a.account, a.window_hours)
+    if hits is None:
+        log("WARNING: Sent pre-check inconclusive; proceeding would be unsafe. Refusing send.")
+        ledger_record(conn, a.key, a.to, a.subject, "refused-precheck-inconclusive",
+                      notes="Sent search inconclusive; human verify before retry")
+        return 2
+    if hits:
+        log(f"REFUSED: {len(hits)} matching send(s) already in Sent within {a.window_hours}h: {hits[0][1]!r}")
+        ledger_record(conn, a.key, a.to, a.subject, "duplicate-refused",
+                      message_id=hits[0][0], notes="found in Sent pre-check")
+        return 2
+
+    if a.dry_run:
+        log(f"DRY RUN: gates passed for key={a.key}; send skipped.")
+        return 0
+
+    # Gate 3: send once, verify on ambiguity
+    status, detail = do_send(cli, a.to, a.subject, a.body_file, a.account)
+    if status == "sent":
+        log(f"SENT (id={detail})")
+        ledger_record(conn, a.key, a.to, a.subject, "sent", message_id=detail)
+        return 0
+
+    log(f"AMBIGUOUS result ({detail}). Verifying Sent before any retry...")
+    time.sleep(5)
+    hits = sent_search(cli, a.to, a.subject, a.account, a.window_hours)
+    if hits:
+        log(f"CONFIRMED in Sent: {hits[0][1]!r}. No retry. Recorded as verified.")
+        ledger_record(conn, a.key, a.to, a.subject, "verified",
+                      message_id=hits[0][0], notes=f"ambiguous send landed: {detail}")
+        return 0
+    log("Send could not be confirmed in Sent. NOT retrying. Human must verify before any retry.")
+    ledger_record(conn, a.key, a.to, a.subject, "failed-unconfirmed", notes=detail)
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main())
